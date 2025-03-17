@@ -1,224 +1,162 @@
-import os
+#!/usr/bin/env python3
+"""
+gui.py
+
+A Tkinter GUI to control the trading bot.
+Features:
+  - Chart type drop-down ("5min", "15min", "1day")
+  - Symbol drop-down for charting.
+  - Start Trading, Stop Trading, and Exit buttons.
+  - A log panel (left) and a recent transactions list (right).
+  - A "Show Chart" button on the main screen.
+  - Confirmation popups with three buttons: Buy, Cancel, and Show Chart.
+"""
+
+import threading
 import time
-from datetime import datetime
-import requests
-import pandas as pd
-import ta
-import smtplib
-from email.mime.text import MIMEText
-#from numpy import nan as npNaN
-# === Configuration ===
-TEST_MODE = True  # Set to False to run live
+from typing import Optional
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from automation_test import CryptoAPITrading, get_available_usd_products, plot_macd_volume
+import matplotlib.pyplot as plt
 
-TRADE_AMOUNT_USD = 50.0      # Maximum USD to trade per coin
-STOP_LOSS_PERCENT = 0.01     # 1% stop-loss
-TAKE_PROFIT_PERCENT = 0.03   # 3% take-profit
+def gui_confirm_trade(action: str, symbol: str, quantity: float, total_usd: float, profit_loss: Optional[float] = None) -> bool:
+    profit_str = f"{profit_loss:.2f}" if profit_loss is not None else "N/A"
+    result = {"confirmed": False}
+    win = tk.Toplevel()
+    win.title(f"Confirm {action.capitalize()} for {symbol}")
+    info = f"Action: {action.upper()} for {symbol}?\nQuantity: {quantity:.8f}\nTotal USD: ${total_usd:.2f}\nProfit/Loss: ${profit_str}"
+    lbl = tk.Label(win, text=info, padx=10, pady=10)
+    lbl.pack()
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=10)
+    
+    def on_confirm():
+        result["confirmed"] = True
+        win.destroy()
+    
+    def on_cancel():
+        win.destroy()
+    
+    def on_show_chart():
+        # Show chart using 5min data
+        plot_macd_volume(bot, symbol, "5min")
+    
+    tk.Button(btn_frame, text="Buy", command=on_confirm).pack(side="left", padx=5)
+    tk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="left", padx=5)
+    tk.Button(btn_frame, text="Show Chart", command=on_show_chart).pack(side="left", padx=5)
+    
+    win.grab_set()
+    win.wait_window()
+    return result["confirmed"]
 
-# List of coins (symbols as used by Robinhood)
-COIN_LIST = ["BTC", "ETH", "ADA", "XRP", "DOGE"]
-  # Replace with your API key
+class TradingBotGUI(tk.Tk):
+    def __init__(self, bot: CryptoAPITrading):
+        super().__init__()
+        self.bot = bot
+        self.title("Trading Bot GUI")
+        self.geometry("900x600")
+        self.chart_type_var = tk.StringVar(value="5min")
+        self.symbol_var = tk.StringVar(value="BTC-USD")
+        self.running = False
+        self.trading_thread = None
 
-# Robinhood credentials (set these as environment variables)
-ROBINHOOD_TOKEN = "rh-api-e861379b-6647-4b9a-8568-f0223c785d3d" #os.environ.get("ROBINHOOD_TOKEN")
-ROBINHOOD_ACCOUNT_ID ="4SEZokUELmIXu/9JUxn7LDVH8Aiw79NtkSgZyVXjdyI="# os.environ.get("ROBINHOOD_ACCOUNT_ID")  # Your crypto account ID
+        # Main frame with left (log) and right (transactions) panels.
+        main_frame = tk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-# Base URL for official Robinhood Crypto endpoints
-BASE_URL = "https://api.robinhood.com"
+        left_frame = tk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        right_frame = tk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=10, pady=10)
 
-# === Email (Alert) Configuration ===
-# The following environment variables must be set:
-# EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM, EMAIL_TO
-positions = {}
-def send_email(subject, message):
-    """Send an email alert using SMTP."""
-    smtp_server = os.environ.get("EMAIL_SMTP_SERVER")
-    smtp_port = int(os.environ.get("EMAIL_SMTP_PORT", 587))
-    email_username = os.environ.get("EMAIL_USERNAME")
-    email_password = os.environ.get("EMAIL_PASSWORD")
-    email_from = os.environ.get("EMAIL_FROM")
-    email_to = os.environ.get("EMAIL_TO")
+        # Left Frame Controls
+        control_frame = tk.Frame(left_frame)
+        control_frame.pack(pady=10)
 
-    msg = MIMEText(message)
-    msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = email_to
+        tk.Label(control_frame, text="Select Chart Type:").grid(row=0, column=0, padx=5)
+        self.chart_type_menu = ttk.Combobox(control_frame, textvariable=self.chart_type_var, values=["5min", "15min", "1day"])
+        self.chart_type_menu.grid(row=0, column=1, padx=5)
 
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Secure the connection
-        server.login(email_username, email_password)
-        server.sendmail(email_from, [email_to], msg.as_string())
-        server.quit()
-        print("Email sent successfully.")
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+        tk.Label(control_frame, text="Select Symbol for Chart:").grid(row=0, column=2, padx=5)
+        available_symbols = get_available_usd_products()
+        self.symbol_var.set(available_symbols[0] if available_symbols else "BTC-USD")
+        self.symbol_menu = ttk.Combobox(control_frame, textvariable=self.symbol_var, values=available_symbols)
+        self.symbol_menu.grid(row=0, column=3, padx=5)
 
-def log_trade(message):
-    """Append trade details to a text log."""
-    with open("trade_log.txt", "a") as f:
-        f.write(f"{datetime.now()} - {message}\n")
+        self.start_button = tk.Button(control_frame, text="Start Trading", command=self.start_trading)
+        self.start_button.grid(row=0, column=4, padx=5)
+        self.stop_button = tk.Button(control_frame, text="Stop Trading", command=self.stop_trading)
+        self.stop_button.grid(row=0, column=5, padx=5)
+        self.exit_button = tk.Button(control_frame, text="Exit", command=self.destroy)
+        self.exit_button.grid(row=0, column=6, padx=5)
+        self.show_chart_button = tk.Button(control_frame, text="Show Chart", command=self.show_chart)
+        self.show_chart_button.grid(row=0, column=7, padx=5)
 
-# === HTTP Headers for Robinhood API ===
-headers = {
-    "Authorization": f"Bearer {ROBINHOOD_TOKEN}",
-    "Content-Type": "application/json"
-}
+        # Left Frame Log Display
+        self.log_text = tk.Text(left_frame, state='disabled', height=25)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
 
-def get_recent_candles(symbol, interval="1minute", span="day", limit=100):
-    """
-    Fetch recent historical candle data for a given symbol from Robinhood.
-    Endpoint: GET /crypto/historicals/{symbol}/
-    """
-    url = f"{BASE_URL}/crypto/historicals/{symbol}/"
-    params = {
-        "interval": interval,
-        "span": span
-    }
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
-        if "results" not in data:
-            print(f"No candle data for {symbol}: {data}")
-            return None
-        df = pd.DataFrame(data["results"])
-        # Convert price columns to numeric
-        for col in ['open_price', 'close_price', 'high_price', 'low_price']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.sort_values("begins_at").tail(limit)
-        return df
-    except Exception as e:
-        print(f"Error fetching candles for {symbol}: {e}")
-        return None
+        # Right Frame: Recent Transactions
+        tk.Label(right_frame, text="Recent Transactions:").pack(pady=5)
+        self.trans_listbox = tk.Listbox(right_frame, height=25)
+        self.trans_listbox.pack(fill=tk.BOTH, expand=True)
 
-def calculate_indicators(df):
-    """Calculate RSI and MACD on 'close_price' and return latest values."""
-    df['RSI'] = ta.rsi(df['close_price'], length=14)
-    macd_df = ta.macd(df['close_price'], fast=12, slow=26, signal=9)
-    df['MACD'] = macd_df['MACD_12_26_9']
-    df['MACD_signal'] = macd_df['MACDs_12_26_9']
-    rsi = df['RSI'].dropna().iloc[-1]
-    macd = df['MACD'].dropna().iloc[-1]
-    macd_signal = df['MACD_signal'].dropna().iloc[-1]
-    return rsi, macd, macd_signal
+    def log(self, message: str):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
 
-def check_signal(symbol):
-    """
-    Check indicators for the coin.
-      - Returns "BUY" if RSI < 30 and MACD > MACD_signal.
-      - Returns "SELL" if RSI > 70 and MACD < MACD_signal.
-      - Returns None otherwise.
-    """
-    df = get_recent_candles(symbol)
-    if df is None or len(df) < 30:
-        return None
-    try:
-        rsi, macd, macd_signal = calculate_indicators(df)
-        print(f"{symbol}: RSI={rsi:.2f}, MACD={macd:.4f}, Signal={macd_signal:.4f}")
-        if rsi < 30 and macd > macd_signal:
-            return "BUY"
-        elif rsi > 70 and macd < macd_signal:
-            return "SELL"
-    except Exception as e:
-        print(f"Error calculating indicators for {symbol}: {e}")
-    return None
+    def add_transaction(self, message: str):
+        self.trans_listbox.insert(tk.END, message)
+        self.trans_listbox.yview(tk.END)
 
-def get_current_price(symbol):
-    """
-    Get the current price using the official quote endpoint:
-      GET /crypto/quotes/{symbol}/
-    """
-    url = f"{BASE_URL}/crypto/quotes/{symbol}/"
-    try:
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        price = data.get("mark_price") or data.get("last_trade_price")
-        return float(price)
-    except Exception as e:
-        print(f"Error fetching price for {symbol}: {e}")
-        return None
+    def start_trading(self):
+        if not self.running:
+            self.running = True
+            self.trading_thread = threading.Thread(target=self.run_trading_loop, daemon=True)
+            self.trading_thread.start()
+            self.log("Trading started.")
 
-def place_order(symbol, side, order_type="market", funds=None, size=None):
-    """
-    Place an order via the official endpoint:
-      POST /crypto/orders/
-    For a BUY order, specify 'funds' (USD amount). For a SELL, specify 'size' (quantity).
-    """
-    url = f"{BASE_URL}/crypto/orders/"
-    payload = {
-        "account_id": ROBINHOOD_ACCOUNT_ID,
-        "symbol": symbol,
-        "side": side,
-        "order_type": order_type,
-        "time_in_force": "gtc"  # Good 'til canceled
-    }
-    if side.lower() == "buy" and funds:
-        payload["funds"] = str(funds)
-    elif side.lower() == "sell" and size:
-        payload["size"] = str(size)
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        order = response.json()
-        if response.status_code not in [200, 201]:
-            print(f"Order error for {symbol}: {order}")
-            return None
-        return order
-    except Exception as e:
-        print(f"Error placing order for {symbol}: {e}")
-        return None
+    def stop_trading(self):
+        self.running = False
+        self.log("Trading stopped.")
 
-# === Main Trading Loop ===
-while True:
-    for coin in COIN_LIST:
-        signal = check_signal(coin)
-        current_price = get_current_price(coin)
-        if current_price is None:
-            continue
-        print(f"{datetime.now()} - {coin} current price: ${current_price:.4f} | Signal: {signal}")
+    def run_trading_loop(self):
+        chart_type = self.chart_type_var.get()
+        symbols = get_available_usd_products()
+        filtered_symbols = [sym for sym in symbols if sym in {"BTC-USD", "ETH-USD", "LTC-USD", "DOGE-USD", "TRUMP-USD"}]
+        while self.running:
+            for symbol in filtered_symbols:
+                if not self.running:
+                    break
+                self.log(f"Scanning {symbol} for buy conditions using {chart_type} chart...")
+                self.bot.trade_crypto(symbol, chart_type)
+            self.bot.check_portfolio()
+            self.log("Cycle complete. Waiting 30 seconds...")
+            for _ in range(30):
+                if not self.running:
+                    break
+                time.sleep(1)
 
-        # If already holding a position, check if stop-loss or take-profit conditions are met.
-        if coin in positions:
-            entry_price = positions[coin]['entry_price']
-            if current_price <= entry_price * (1 - STOP_LOSS_PERCENT) or current_price >= entry_price * (1 + TAKE_PROFIT_PERCENT):
-                effective_signal = "SELL"
-                print(f"{coin}: TP/SL condition met (Entry: ${entry_price:.4f}, Current: ${current_price:.4f}).")
-            else:
-                effective_signal = signal
-        else:
-            effective_signal = signal
+    def show_chart(self):
+        symbol = self.symbol_var.get()
+        chart_type = self.chart_type_var.get()
+        self.log(f"Plotting chart for {symbol} with {chart_type} data...")
+        plot_macd_volume(self.bot, symbol, chart_type)
 
-        # --- BUY Condition ---
-        if effective_signal == "BUY" and coin not in positions:
-            print(f"Strong BUY signal for {coin}. Attempting to buy ${TRADE_AMOUNT_USD} worth at ${current_price:.4f}")
-            if TEST_MODE:
-                confirm = input(f"Confirm BUY {coin} for ${TRADE_AMOUNT_USD}? (y/n): ")
-                if confirm.lower() != 'y':
-                    print("Buy canceled by user.")
-                    continue
-            order = place_order(coin, side="buy", order_type="market", funds=TRADE_AMOUNT_USD)
-            if order:
-                print(f"BUY order placed for {coin}: {order}")
-                log_trade(f"BUY {coin} @ ${current_price:.4f}, order: {order}")
-                send_email("Scalping Bot BUY Alert", f"BUY {coin} @ ${current_price:.4f}")
-                filled_size = float(order.get("quantity", 0))
-                positions[coin] = {"size": filled_size, "entry_price": current_price}
+def main():
+    bot = CryptoAPITrading()
+    # Override confirm_trade with the GUI version.
+    bot.verify_stop_loss_orders()
+    bot.confirm_trade = lambda a, s, q, t, p=None: gui_confirm_trade(a, s, q, t, p)
+    # Set the transaction callback so that trades update the transactions list.
+    def transaction_callback(message: str):
+        app.add_transaction(message)
+    bot.transaction_callback = transaction_callback
+    app = TradingBotGUI(bot)
+    app.mainloop()
 
-        # --- SELL Condition ---
-        elif effective_signal == "SELL" and coin in positions:
-            size_to_sell = positions[coin]['size']
-            print(f"Strong SELL signal for {coin}. Attempting to sell {size_to_sell:.6f} units at ${current_price:.4f}")
-            if TEST_MODE:
-                confirm = input(f"Confirm SELL {coin}? (y/n): ")
-                if confirm.lower() != 'y':
-                    print("Sell canceled by user.")
-                    continue
-            order = place_order(coin, side="sell", order_type="market", size=size_to_sell)
-            if order:
-                print(f"SELL order placed for {coin}: {order}")
-                entry_price = positions[coin]['entry_price']
-                pnl = ((current_price - entry_price) / entry_price) * 100.0
-                log_trade(f"SELL {coin} @ ${current_price:.4f}, P/L = {pnl:.2f}%, order: {order}")
-                send_email("Scalping Bot SELL Alert", f"SELL {coin} @ ${current_price:.4f}, P/L = {pnl:.2f}%")
-                positions.pop(coin)
-        # Else: No action for this coin.
-    # Wait 30 seconds before the next cycle.
-    time.sleep(30)
+if __name__ == "__main__":
+    main()

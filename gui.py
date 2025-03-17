@@ -12,7 +12,7 @@ class TradingBotGUI(tk.Tk):
     def __init__(self, bot: CryptoAPITrading):
         super().__init__()
         self.bot = bot
-        self.title("Trading Bot")
+        self.title("Trading Bot GUI")
         self.geometry("600x400")
         self.chart_type_var = tk.StringVar(value="5min")
         self.running = False
@@ -27,10 +27,7 @@ class TradingBotGUI(tk.Tk):
         self.start_button.pack(pady=10)
         self.stop_button = tk.Button(self, text="Stop Trading", command=self.stop_trading)
         self.stop_button.pack(pady=10)
-                # After your Stop Trading button...
-        ## NEW: Add a Show Chart button on the main screen
-        self.show_chart_button = tk.Button(control_frame, text="Show Chart", command=self.show_chart)
-        self.show_chart_button.grid(row=0, column=6, padx=5)
+
         self.log_text = tk.Text(self, state='disabled', height=10)
         self.log_text.pack(fill=tk.BOTH, padx=10, pady=10)
 
@@ -55,7 +52,7 @@ class TradingBotGUI(tk.Tk):
         chart_type = self.chart_type_var.get()
         symbols = get_available_usd_products()
         # Optionally filter symbols for testing:
-        filtered_symbols = [sym for sym in symbols if sym in {"BTC-USD", "ETH-USD", "LTC-USD", "DOGE-USD", "TRUMP-USD","ADA-USD"}]
+        filtered_symbols = [sym for sym in symbols if sym in {"BTC-USD", "ETH-USD", "LTC-USD", "DOGE-USD", "TRUMP-USD"}]
         while self.running:
             for symbol in filtered_symbols:
                 if not self.running:
@@ -63,23 +60,18 @@ class TradingBotGUI(tk.Tk):
                 self.log(f"Checking {symbol} for buy conditions using {chart_type} chart...")
                 self.bot.trade_crypto(symbol, chart_type)
             self.bot.check_portfolio()
-            self.log("Cycle complete. Waiting 30 seconds...")
+            self.log("Cycle complete. Waiting 30 seconds...")   
             for _ in range(30):
                 if not self.running:
                     break
                 time.sleep(1)
-        ## NEW: Add a method to show the chart using the selected symbol and chart type
-    def show_chart(self):
-        symbol = self.symbol_var.get()  # You'll need a symbol selector – see below.
-        chart_type = self.chart_type_var.get()
-        self.log(f"Plotting chart for {symbol} with {chart_type} data...")
-        plot_macd_volume(self.bot, symbol, chart_type)
+
 def plot_macd_volume(bot, symbol: str, chart_type: str = "1day"):
     """
     Fetches historical data for the given symbol using the specified chart_type,
     calculates MACD (12,26,9) and plots the MACD, its signal, and volume on a chart.
     """
-    df = bot.get_historical_prices(symbol, chart_type)
+    df = bot.get_historical_prices(symbol)
     if df is None or df.empty:
         messagebox.showerror("Plot Error", f"No historical data for {symbol}")
         return
@@ -93,8 +85,8 @@ def plot_macd_volume(bot, symbol: str, chart_type: str = "1day"):
         messagebox.showerror("Plot Error", f"Error calculating indicators for {symbol}: {e}")
         return
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    ax1.plot(df["time"], df["macd"], label="MACD")
-    ax1.plot(df["time"], df["macd_signal"], label="Signal")
+    ax1.plot(df["time"], df["macd"], label="MACD", marker='o')
+    ax1.plot(df["time"], df["macd_signal"], label="Signal", marker='o')
     ax1.set_title(f"{symbol} MACD ({chart_type})")
     ax1.legend()
     ax2.bar(df["time"], df["volume"], label="Volume", color="gray")
@@ -103,6 +95,9 @@ def plot_macd_volume(bot, symbol: str, chart_type: str = "1day"):
     plt.show()
 
 def gui_confirm_trade(action: str, symbol: str, quantity: float, total_usd: float, profit_loss: Optional[float] = None, indicator_info: str = "", plot_callback: Optional[callable] = None) -> bool:
+    """
+    Displays a confirmation popup with trade details and includes a "Show Chart" button if a plot_callback is provided.
+    """
     profit_loss_str = f"{profit_loss:.2f}" if profit_loss is not None else "N/A"
     result = {"confirmed": False}
     win = tk.Toplevel()
@@ -110,6 +105,7 @@ def gui_confirm_trade(action: str, symbol: str, quantity: float, total_usd: floa
     info = f"Action: {action.upper()} for {symbol}?\nQuantity: {quantity:.8f}\nTotal USD: ${total_usd:.2f}\nProfit/Loss: ${profit_loss_str}\n{indicator_info}"
     lbl = tk.Label(win, text=info, padx=10, pady=10)
     lbl.pack()
+
     btn_frame = tk.Frame(win)
     btn_frame.pack(pady=10)
     
@@ -122,10 +118,11 @@ def gui_confirm_trade(action: str, symbol: str, quantity: float, total_usd: floa
     
     def on_show_chart():
         if plot_callback:
-            plot_callback()
-    
+            plot_callback()  # call the provided plot callback function
+
     tk.Button(btn_frame, text="Confirm", command=on_confirm).pack(side="left", padx=5)
     tk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="left", padx=5)
+    # NEW: Add Show Chart button if a plot_callback is provided.
     if plot_callback:
         tk.Button(btn_frame, text="Show Chart", command=on_show_chart).pack(side="left", padx=5)
     

@@ -1,24 +1,43 @@
+#!/usr/bin/env python3
+"""
+robinhood_bot.py
+
+This module implements the CryptoAPITrading class that:
+  - Fetches historical data from Coinbase with configurable chart type.
+  - Calculates MACD (12,26,9) and volume condition (current volume >= avg volume of previous 10 candles).
+  - Buys if a bullish MACD crossover is detected and volume condition is met (only if not already active).
+    • Buy is a LIMIT order at ask + $0.01.
+    • Immediately after buy, a STOP LOSS order is sent at 5% below the buy price.
+  - Sells if either a bearish MACD crossover is detected (on daily data) or profit reaches 10%.
+    • Before selling, any stop loss order is cancelled.
+  - Open trades are stored in a JSON file with details: (buy_price, quantity, stop_loss, stop_order_id, status).
+  - A transaction_callback is called when trades occur so the GUI can display messages.
+  - All actions are logged.
+  - The bot runs in a loop (every 30 sec) scanning coins.
+"""
+
 import base64
 import datetime
-import hashlib
-import hmac
 import json
 import os
-import threading
 import time
 import uuid
 import requests
 import pandas as pd
 import ta
 import logging
-from typing import Optional
 from typing import Any, Dict, Optional, Tuple, List
 from nacl.signing import SigningKey
 import signal
-import tkinter as tk
-from tkinter import ttk, messagebox
 
-# Configure logging: logs are printed to the console and saved to a file.
+# Define color functions for console logging.
+def red_text(msg: str) -> str:
+    return f"\033[91m{msg}\033[0m"
+
+def green_text(msg: str) -> str:
+    return f"\033[92m{msg}\033[0m"
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,38 +50,39 @@ logging.basicConfig(
 def timeout_handler(signum, frame):
     raise TimeoutError
 
-## NEW: Helper function to convert chart_type to days and granularity.
 def get_chart_parameters(chart_type: str) -> Tuple[int, int]:
     """
     Returns a tuple (days, granularity) based on chart_type.
-      - "5min": Use 1 day of 5-minute candles (300 seconds) ~ 288 candles.
-      - "15min": Use 2 days of 15-minute candles (900 seconds) ~ 192 candles.
-      - "1day": Use 50 days of daily candles (86400 seconds).
+      - "5min": 1 day of 5-minute candles (300 sec) ~288 candles.
+      - "15min": 1 day of 15-minute candles (900 sec) ~96 candles.
+      - "1day": 50 days of daily candles (86400 sec).
     """
     if chart_type == "5min":
-        return (1, 300)       # 1 day * 24 * (60/5) = 288 candles
+        return (1, 300)
     elif chart_type == "15min":
-        return (1, 900)       # 2 days * 24 * (60/15) = 192 candles
+        return (1, 900)
     elif chart_type == "1day":
-        return (501, 86400)
+        return (50, 86400)
     else:
-        return (1, 86400)    # default
+        return (50, 86400)
 
 class CryptoAPITrading:
     def __init__(self) -> None:
         """
-        Initialize the Robinhood Trading Bot with authentication, a persistent HTTP session,
-        and an internal state for open trades.
-        open_trades stores: symbol -> (buy_price, quantity, stop_loss, stop_order_id)
+        Initialize the bot.
+        open_trades: symbol -> (buy_price, quantity, stop_loss, stop_order_id, status)
+          Status is "active" when bought, "sold" after exit.
+        Also, transaction_callback (if set) is called with a message after a trade.
         """
-        self.api_key = "rh-api-e861379b-6647-4b9a-8568-f0223c785d3d"  # Replace with your API key
-        base64_key = "4SEZokUELmIXu/9JUxn7LDVH8Aiw79NtkSgZyVXjdyI="    # Replace with your base64-encoded key
+        self.api_key = "rh-api-e861379b-6647-4b9a-8568-f0223c785d3d"  # Replace with your key
+        base64_key = "4SEZokUELmIXu/9JUxn7LDVH8Aiw79NtkSgZyVXjdyI="    # Replace with your key
         private_key_seed = base64.b64decode(base64_key)
         self.private_key = SigningKey(private_key_seed)
         self.base_url = "https://trading.robinhood.com"
         self.session = requests.Session()
-        self.open_trades: Dict[str, Tuple[float, float, float, Optional[str]]] = {}
+        self.open_trades: Dict[str, Tuple[float, float, float, Optional[str], str]] = {}
         self.load_open_trades()
+        self.transaction_callback = None  # NEW: Callback for transactions
         logging.info("Initialized CryptoAPITrading client.")
 
     def load_open_trades(self) -> None:
@@ -71,8 +91,18 @@ class CryptoAPITrading:
             try:
                 with open(filename, "r") as f:
                     data = json.load(f)
-                self.open_trades = {k: (float(v[0]), float(v[1]), float(v[2]), v[3] if v[3] != "" else None)
-                                     for k, v in data.items()}
+                new_trades = {}
+                for k, v in data.items():
+                    if isinstance(v, list) and len(v) >= 5:
+                        buy_price = float(v[0])
+                        quantity = float(v[1])
+                        stop_loss = float(v[2])
+                        stop_order_id = v[3] if v[3] != "" else None
+                        status = v[4]
+                        new_trades[k] = (buy_price, quantity, stop_loss, stop_order_id, status)
+                    else:
+                        logging.error(f"Invalid format for trade {k}: {v}")
+                self.open_trades = new_trades
                 logging.info("Open trades loaded from file.")
             except Exception as e:
                 logging.error(f"Error loading open trades: {e}")
@@ -85,7 +115,7 @@ class CryptoAPITrading:
         filename = "open_trades.json"
         try:
             with open(filename, "w") as f:
-                data = {k: [v[0], v[1], v[2], v[3] if v[3] is not None else ""] for k, v in self.open_trades.items()}
+                data = {k: [v[0], v[1], v[2], v[3] if v[3] is not None else "", v[4]] for k, v in self.open_trades.items()}
                 json.dump(data, f)
             logging.info("Open trades saved to file.")
         except Exception as e:
@@ -104,7 +134,7 @@ class CryptoAPITrading:
         headers = {
             "x-api-key": self.api_key,
             "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
-            "x-timestamp": str(timestamp),
+            "x-timestamp": str(timestamp)
         }
         logging.debug(f"Generated headers: {headers}")
         return headers
@@ -147,7 +177,6 @@ class CryptoAPITrading:
         path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
         return self.make_api_request("GET", path)
 
-    # CHANGED: get_historical_prices now accepts a chart_type parameter.
     def get_historical_prices(self, symbol: str, chart_type: str = "1day") -> Optional[pd.DataFrame]:
         try:
             days, granularity = get_chart_parameters(chart_type)
@@ -175,17 +204,14 @@ class CryptoAPITrading:
             logging.error(f"Exception in get_historical_prices for {symbol}: {e}")
             return None
 
-    # CHANGED: calculate_indicators now accepts a chart_type parameter.
     def calculate_indicators(self, symbol: str, chart_type: str = "1day") -> Tuple[Optional[float], Optional[float], Optional[bool]]:
         """
-        Calculates MACD using historical prices fetched according to chart_type (using MACD parameters 12,26,9)
-        and computes a volume condition: whether the current candle's volume is at least 125% of the average volume
-        of the previous 10 candles.
-        
+        Calculates MACD (12,26,9) and computes volume condition.
+        Volume condition: current volume >= average volume of previous 10 candles.
         Returns:
           - Latest MACD value,
           - Latest MACD signal,
-          - Volume condition (True if current volume >= 125% of the 10-day average, else False).
+          - Volume condition (True if met, else False).
         """
         df = self.get_historical_prices(symbol, chart_type)
         if df is None or df.empty:
@@ -201,14 +227,12 @@ class CryptoAPITrading:
             df["macd_signal"] = macd_indicator.macd_signal()
             latest_macd = df["macd"].iloc[-1]
             latest_signal = df["macd_signal"].iloc[-1]
-            # Compute volume condition using the volume column.
-            # Ensure we have at least 11 candles (last candle + previous 10).
             if len(df) >= 11:
                 avg_volume = df["volume"].iloc[-11:-1].astype(float).mean()
             else:
                 avg_volume = df["volume"].astype(float).mean()
             current_volume = float(df["volume"].iloc[-1])
-            volume_condition = current_volume >= 1.25 * avg_volume
+            volume_condition = current_volume >= avg_volume
             logging.info(f"Indicators for {symbol} ({chart_type}) | MACD: {latest_macd:.4f}, Signal: {latest_signal:.4f}, Volume Condition: {volume_condition} (Current: {current_volume}, Avg10: {avg_volume:.2f})")
             return latest_macd, latest_signal, volume_condition
         except Exception as e:
@@ -217,9 +241,8 @@ class CryptoAPITrading:
 
     def confirm_trade(self, action: str, symbol: str, quantity: float, total_usd: float, profit_loss: Optional[float] = None) -> bool:
         """
-        This method will be overridden by the GUI version.
+        Text-based confirmation (will be overridden by GUI).
         """
-        # Fallback text-based confirmation.
         print("\n----------------------------------")
         print(f"Trade Action: {action.upper()} for {symbol}")
         print(f"Quantity: {quantity:.8f}")
@@ -245,15 +268,30 @@ class CryptoAPITrading:
             rounded = int(q / 0.1) * 0.1
             return f"{rounded:.2f}"
 
-    def place_order(self, side: str, symbol: str, amount: float) -> Optional[Any]:
+    def place_order(self, side: str, symbol: str, amount: float, limit_price: Optional[float] = None) -> Optional[Any]:
+        """
+        Places a LIMIT order for buying (if side=="buy" and limit_price provided) or a market order for selling.
+        """
         asset_quantity_str = self.format_quantity(amount)
-        body = {
-            "client_order_id": str(uuid.uuid4()),
-            "side": side,
-            "type": "market",
-            "symbol": symbol,
-            "market_order_config": {"asset_quantity": asset_quantity_str}
-        }
+        if side.lower() == "buy" and limit_price is not None:
+            body = {
+                "client_order_id": str(uuid.uuid4()),
+                "side": side,
+                "type": "limit",
+                "symbol": symbol,
+                "limit_order_config": {
+                    "asset_quantity": asset_quantity_str,
+                    "limit_price": f"{limit_price:.2f}"
+                }
+            }
+        else:
+            body = {
+                "client_order_id": str(uuid.uuid4()),
+                "side": side,
+                "type": "market",
+                "symbol": symbol,
+                "market_order_config": {"asset_quantity": asset_quantity_str}
+            }
         path = "/api/v1/crypto/trading/orders/"
         order_response = self.make_api_request("POST", path, json.dumps(body))
         if order_response:
@@ -262,18 +300,19 @@ class CryptoAPITrading:
             logging.error("Order placement failed.")
         return order_response
 
-    ## NEW: Place a formal stop loss order.
     def place_stop_loss_order(self, side: str, symbol: str, amount: float, stop_price: float) -> Optional[str]:
         asset_quantity_str = self.format_quantity(amount)
         stop_price_str = f"{stop_price:.2f}"
         body = {
             "client_order_id": str(uuid.uuid4()),
             "side": side,
-            "type": "stop",
+            "type": "stop_limit",
             "symbol": symbol,
-            "stop_order_config": {
+            "stop_limit_order_config": {
                 "asset_quantity": asset_quantity_str,
-                "stop_price": stop_price_str
+                "stop_price": stop_price_str,
+                "limit_price": stop_price_str,  # Using the same value for limit price
+                "time_in_force": "gtc"          # Good 'Til Canceled – order remains active until cancelled
             }
         }
         path = "/api/v1/crypto/trading/orders/"
@@ -284,8 +323,6 @@ class CryptoAPITrading:
         else:
             logging.error("Stop loss order placement failed.")
             return None
-
-    ## NEW: Cancel an order by its ID.
     def cancel_order(self, order_id: str) -> Optional[Any]:
         path = f"/api/v1/crypto/trading/orders/{order_id}/cancel/"
         return self.make_api_request("POST", path)
@@ -293,52 +330,69 @@ class CryptoAPITrading:
     def trade_crypto(self, symbol: str, chart_type: str = "1day") -> None:
         buying_power = self.get_buying_power()
         if buying_power < 10:
-            logging.error(f"Not enough buying power for trading: ${buying_power}")
+            logging.error(red_text(f"Not enough buying power: ${buying_power}"))
+            return
+        if symbol in self.open_trades and self.open_trades[symbol][4] == "active":
+            logging.info(f"{symbol} is already active. Skipping buy.")
             return
         ticker = self.get_best_bid_ask(symbol)
         if not ticker:
-            logging.error(f"Unable to fetch ticker for {symbol}")
+            logging.error(red_text(f"Unable to fetch ticker for {symbol}"))
             return
         try:
-            current_price = float(ticker["results"][0]["ask_inclusive_of_buy_spread"])
+            ask_price = float(ticker["results"][0]["ask_inclusive_of_buy_spread"])
         except Exception as e:
-            logging.error(f"Error parsing ask price for {symbol}: {e}")
+            logging.error(red_text(f"Error parsing ask price for {symbol}: {e}"))
             return
         macd, macd_signal, vol_cond = self.calculate_indicators(symbol, chart_type)
         if macd is None or macd_signal is None or vol_cond is None:
-            logging.error(f"Could not fetch complete indicators for {symbol}")
+            logging.error(red_text(f"Could not fetch complete indicators for {symbol}"))
             return
-        logging.info(f"{symbol} ({chart_type}) | MACD: {macd:.4f}, Signal: {macd_signal:.4f}, Volume Condition: {vol_cond}, Price: ${current_price}")
-        # Buy condition: bullish MACD crossover AND volume condition met.
+        logging.info(f"{symbol} ({chart_type}) | MACD: {macd:.4f}, Signal: {macd_signal:.4f}, Volume Condition: {vol_cond}, Ask Price: ${ask_price}")
         if macd > macd_signal and vol_cond:
-            logging.info(f"\033[92mBullish condition met for {symbol}.\033[0m")
+            logging.info(green_text(f"Bullish condition met for {symbol}."))
             trade_usd = min(buying_power, 50)
-            quantity = trade_usd / current_price
+            limit_price = ask_price + 0.01
+            quantity = trade_usd / limit_price
             if self.confirm_trade("buy", symbol, quantity, trade_usd):
-                logging.info(f"\033[92mBuying {symbol} at ${current_price} using ${trade_usd} (Quantity: {quantity:.8f})\033[0m")
-                order = self.place_order("buy", symbol, quantity)
+                logging.info(green_text(f"Placing limit buy order for {symbol} at ${limit_price:.2f} (Quantity: {quantity:.8f})"))
+                order = self.place_order("buy", symbol, quantity, limit_price=limit_price)
                 if order:
-                    # For stop loss we can keep the old logic or remove it; here, we'll remove stop loss orders for simplicity.
-                    self.open_trades[symbol] = (current_price, quantity, None, None)
+                    buy_price = limit_price
+                    stop_loss = buy_price * 0.95
+                    logging.info(green_text(f"Placing stop loss order for {symbol} at ${stop_loss:.2f}"))
+                    stop_order_id = self.place_stop_loss_order("sell", symbol, quantity, stop_loss)
+                    self.open_trades[symbol] = (buy_price, quantity, stop_loss, stop_order_id, "active")
                     self.save_open_trades()
-                    # For exit, we will monitor with a separate method.
-                    self.monitor_trade(symbol, current_price, quantity)
+                    if self.transaction_callback:
+                        self.transaction_callback(f"Bought {symbol} at ${buy_price:.2f} (Qty: {quantity:.8f})")
+                    self.monitor_trade(symbol, buy_price, quantity)
             else:
-                logging.info("\033[91mBuy order canceled by user.\033[0m")
+                logging.info(red_text("Buy order canceled by user."))
         else:
-            logging.info("\033[91mBullish MACD crossover or volume condition not met for {0}. No trade executed.\033[0m".format(symbol))
+            logging.info(red_text(f"Bullish MACD crossover or volume condition not met for {symbol}. No trade executed."))
+
+    def verify_stop_loss_orders(self) -> None:
+        """
+        Checks active trades and reissues a stop loss order if one is missing.
+        """
+        for symbol, trade in self.open_trades.items():
+            buy_price, quantity, stop_loss, stop_order_id, status = trade
+            if status == "active" and stop_order_id is None:
+                new_stop_loss = buy_price * 0.95
+                logging.info(f"Stop loss missing for {symbol}. Reissuing stop loss order at {new_stop_loss:.2f}")
+                new_stop_order_id = self.place_stop_loss_order("sell", symbol, quantity, new_stop_loss)
+                if new_stop_order_id:
+                    self.open_trades[symbol] = (buy_price, quantity, new_stop_loss, new_stop_order_id, "active")
+                    logging.info(f"Reissued stop loss order for {symbol} with order ID: {new_stop_order_id}")
+                else:
+                    logging.error(f"Failed to reissue stop loss order for {symbol}")
+        self.save_open_trades()
 
     def monitor_trade(self, symbol: str, buy_price: float, quantity: float) -> None:
-        logging.info(f"Monitoring {symbol} for exit using bearish MACD crossover.")
+        logging.info(f"Monitoring {symbol} for exit conditions.")
         while True:
-            # For exit, we use daily data.
             daily_df = self.get_historical_prices(symbol, "1day")
-            df = bot.get_historical_prices(symbol, "1day")
-        if df is None or df.empty:
-            print("No data returned for", symbol)
-        else:
-            print("Data shape:", df.shape)
-            print(df.head(10))
             if daily_df is None or daily_df.empty or len(daily_df) < 2:
                 time.sleep(10)
                 continue
@@ -355,18 +409,17 @@ class CryptoAPITrading:
                 logging.error(f"Error calculating daily MACD for {symbol}: {e}")
                 time.sleep(10)
                 continue
-            # Calculate daily volume condition
             try:
                 if len(daily_df) >= 11:
                     avg_vol = daily_df["volume"].iloc[-11:-1].astype(float).mean()
                 else:
                     avg_vol = daily_df["volume"].astype(float).mean()
                 current_vol = float(daily_df["volume"].iloc[-1])
-                vol_cond_daily = current_vol >= 1.25 * avg_vol
+                vol_cond_daily = current_vol >= avg_vol
             except Exception as e:
                 logging.error(f"Error calculating volume condition for {symbol}: {e}")
                 vol_cond_daily = False
-            logging.info(f"{symbol} Monitoring: prev MACD {prev_macd:.4f} vs prev signal {prev_signal:.4f}; current MACD {current_macd:.4f} vs current signal {current_signal:.4f}; Volume condition: {vol_cond_daily}")
+            logging.info(f"{symbol} Monitoring: prev MACD {prev_macd:.4f} vs prev signal {prev_signal:.4f}; current MACD {current_macd:.4f} vs current signal {current_signal:.4f}; Daily Volume Condition: {vol_cond_daily}")
             ticker = self.get_best_bid_ask(symbol)
             if not ticker:
                 time.sleep(10)
@@ -377,32 +430,51 @@ class CryptoAPITrading:
                 logging.error(f"Error parsing ticker for {symbol}: {e}")
                 time.sleep(10)
                 continue
-            logging.info(f"{symbol} current price: ${current_price:.2f}")
-            # Exit condition: bearish crossover and volume condition met.
-            if prev_macd >= prev_signal and current_macd < current_signal and vol_cond_daily:
+            logging.info(f"{symbol} current sell price: ${current_price:.2f}")
+            profit_pct = ((current_price - buy_price) / buy_price) * 100
+            if profit_pct >= 10 or (prev_macd >= prev_signal and current_macd < current_signal and vol_cond_daily):
                 exit_condition = True
             else:
                 exit_condition = False
-
             if exit_condition:
                 total_value = current_price * quantity
                 profit_loss = (current_price - buy_price) * quantity
+                if symbol in self.open_trades:
+                    _, _, _, stop_order_id, _ = self.open_trades[symbol]
+                    if stop_order_id:
+                        cancel_resp = self.cancel_order(stop_order_id)
+                        logging.info(f"Canceled stop loss order for {symbol}: {cancel_resp}")
                 if self.confirm_trade("sell", symbol, quantity, total_value, profit_loss):
                     logging.info(f"Executing sell order for {symbol} at ${current_price:.2f}")
                     self.place_order("sell", symbol, quantity)
                     if symbol in self.open_trades:
-                        del self.open_trades[symbol]
+                        bp, qty, sl, so_id, _ = self.open_trades[symbol]
+                        self.open_trades[symbol] = (bp, qty, sl, so_id, "sold")
                         self.save_open_trades()
+                    if self.transaction_callback:
+                        self.transaction_callback(f"Sold {symbol} at ${current_price:.2f} (Profit: ${profit_loss:.2f})")
                     break
                 else:
                     logging.info("Sell order canceled by user.")
                     break
             time.sleep(30)
-
-    def cancel_order(self, order_id: str) -> Optional[Any]:
-        path = f"/api/v1/crypto/trading/orders/{order_id}/cancel/"
-        return self.make_api_request("POST", path)
-
+    def verify_stop_loss_orders(self) -> None:
+        """
+        For each active trade, check if a stop loss order exists.
+        If not, reissue a stop loss order at 5% below the buy price and update the trade.
+        """
+        for symbol, trade in self.open_trades.items():
+            buy_price, quantity, stop_loss, stop_order_id, status = trade
+            if status == "active" and stop_order_id is None:
+                new_stop_loss = buy_price * 0.95
+                logging.info(f"Stop loss missing for {symbol}. Reissuing stop loss order at {new_stop_loss:.2f}")
+                new_stop_order_id = self.place_stop_loss_order("sell", symbol, quantity, new_stop_loss)
+                if new_stop_order_id:
+                    self.open_trades[symbol] = (buy_price, quantity, new_stop_loss, new_stop_order_id, "active")
+                    logging.info(f"Reissued stop loss order for {symbol} with order ID: {new_stop_order_id}")
+                else:
+                    logging.error(f"Failed to reissue stop loss order for {symbol}")
+        self.save_open_trades()
     def get_holdings(self) -> Optional[List[Dict[str, Any]]]:
         path = "/api/v1/crypto/trading/holdings/"
         holdings = self.make_api_request("GET", path)
@@ -423,13 +495,11 @@ class CryptoAPITrading:
         if not holdings:
             logging.info("No holdings found in portfolio.")
             return
-
         for holding in holdings:
-            logging.info(f"Processing holding (type {type(holding)}): {holding}")
+            logging.info(f"Processing holding: {holding}")
             if isinstance(holding, str):
                 try:
                     holding = json.loads(holding)
-                    logging.info(f"Parsed holding into dict: {holding}")
                 except Exception as e:
                     logging.error(f"Error parsing holding string: {e} - {holding}")
                     continue
@@ -449,7 +519,7 @@ class CryptoAPITrading:
                     logging.error(f"Error parsing average_buy_price for {symbol}: {e}")
                     continue
             if avg_buy is None or avg_buy == 0:
-                if symbol in self.open_trades:
+                if symbol in self.open_trades and self.open_trades[symbol][4] == "active":
                     avg_buy = self.open_trades[symbol][0]
                 else:
                     logging.error(f"No average buy price for {symbol}; skipping.")
@@ -473,13 +543,9 @@ class CryptoAPITrading:
             profit_pct = ((current_price - avg_buy) / avg_buy) * 100
             total_value = current_price * quantity
             profit_loss = (current_price - avg_buy) * quantity
-            df = self.calculate_indicators(symbol, "1day")
-            if df is not None and len(df) > 0:
-                latest_macd = df["macd"].iloc[-1]
-                latest_signal = df["macd_signal"].iloc[-1]
-                logging.info(f"{symbol} | Latest MACD: {latest_macd:.4f}, Signal: {latest_signal:.4f}")
-            logging.info(f"Selling price for {symbol}: ${current_price:.2f}, Total Value: ${total_value:.2f}, Profit/Loss: ${profit_loss:.2f} ({profit_pct:.2f}%)")
-            if profit_pct >= 5 or profit_pct <= -10:
+            _, latest_signal, _ = self.calculate_indicators(symbol, "1day")
+            logging.info(f"{symbol} | Avg Buy: ${avg_buy:.2f}, Current Price: ${current_price:.2f}, Profit/Loss: ${profit_loss:.2f} ({profit_pct:.2f}%)")
+            if profit_pct >= 10 or (latest_signal is not None and profit_pct <= -5):
                 if self.confirm_trade("sell", symbol, quantity, total_value, profit_loss):
                     logging.info(f"Selling {symbol} from portfolio at ${current_price}")
                     self.place_order("sell", symbol, quantity)
@@ -487,6 +553,37 @@ class CryptoAPITrading:
                     logging.info(f"Sell order for {symbol} canceled by user.")
             else:
                 logging.info(f"{symbol} profit {profit_pct:.2f}% does not meet sell thresholds.")
+def plot_macd_volume(bot, symbol: str, chart_type: str = "1day"):
+    """
+    Fetches historical data for the given symbol using the specified chart_type,
+    calculates MACD (12,26,9) and volume, then plots the MACD, its signal, and volume on a chart.
+    """
+    df = bot.get_historical_prices(symbol, chart_type)
+    if df is None or df.empty:
+        from tkinter import messagebox
+        messagebox.showerror("Plot Error", f"No historical data for {symbol} ({chart_type})")
+        return
+    try:
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        macd_indicator = ta.trend.MACD(df["close"], window_fast=12, window_slow=26, window_sign=9)
+        df["macd"] = macd_indicator.macd()
+        df["macd_signal"] = macd_indicator.macd_signal()
+    except Exception as e:
+        from tkinter import messagebox
+        messagebox.showerror("Plot Error", f"Error calculating indicators for {symbol}: {e}")
+        return
+
+    import matplotlib.pyplot as plt
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    ax1.plot(df["time"], df["macd"], label="MACD", marker='o')
+    ax1.plot(df["time"], df["macd_signal"], label="Signal", marker='o')
+    ax1.set_title(f"{symbol} MACD ({chart_type})")
+    ax1.legend()
+    ax2.bar(df["time"], df["volume"], label="Volume", color="gray")
+    ax2.set_title(f"{symbol} Volume ({chart_type})")
+    plt.tight_layout()
+    plt.show()
 
 def get_available_usd_products() -> List[str]:
     url = "https://api.robinhood.com/crypto/trading/pairs/"
@@ -506,99 +603,3 @@ def get_available_usd_products() -> List[str]:
     except Exception as e:
         logging.error(f"Error in get_available_usd_products: {e}")
         return ["BTC-USD", "ETH-USD", "LTC-USD", "DOGE-USD", "TRUMP-USD", "SOL-USD", "ADA-USD"]
-
-## GUI Section
-class TradingBotGUI(tk.Tk):
-    def __init__(self, bot: CryptoAPITrading):
-        super().__init__()
-        self.bot = bot
-        self.title("Trading Bot GUI")
-        self.geometry("800x600")
-        self.chart_type_var = tk.StringVar(value="5min")
-        self.running = False
-        self.trading_thread = None
-
-        # Controls
-        control_frame = tk.Frame(self)
-        control_frame.pack(pady=10)
-
-        tk.Label(control_frame, text="Select Chart Type:").grid(row=0, column=0, padx=5)
-        self.chart_type_menu = ttk.Combobox(control_frame, textvariable=self.chart_type_var, values=["5min", "15min", "1day"])
-        self.chart_type_menu.grid(row=0, column=1, padx=5)
-
-        self.start_button = tk.Button(control_frame, text="Start Trading", command=self.start_trading)
-        self.start_button.grid(row=0, column=2, padx=5)
-        self.stop_button = tk.Button(control_frame, text="Stop Trading", command=self.stop_trading)
-        self.stop_button.grid(row=0, column=3, padx=5)
-
-        # Log display
-        self.log_text = tk.Text(self, state='disabled', height=25)
-        self.log_text.pack(fill=tk.BOTH, padx=10, pady=10)
-
-    def log(self, message: str):
-        self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
-
-    def start_trading(self):
-        if not self.running:
-            self.running = True
-            self.trading_thread = threading.Thread(target=self.run_trading_loop, daemon=True)
-            self.trading_thread.start()
-            self.log("Trading started.")
-
-    def stop_trading(self):
-        self.running = False
-        self.log("Trading stopped.")
-
-    def run_trading_loop(self):
-        chart_type = self.chart_type_var.get()
-        symbols = get_available_usd_products()
-        filtered_symbols = [sym for sym in symbols if sym in {"BTC-USD", "ETH-USD", "LTC-USD", "DOGE-USD", "TRUMP-USD", "SOL-USD", "ADA-USD"}]
-        while self.running:
-            for symbol in filtered_symbols:
-                if not self.running:
-                    break
-                self.log(f"Checking {symbol} for buy conditions using {chart_type} chart...")
-                self.bot.trade_crypto(symbol, chart_type)
-            self.bot.check_portfolio()
-            self.log("Cycle complete. Waiting 30 seconds...")
-            for _ in range(30):
-                if not self.running:
-                    break
-                time.sleep(1)
-
-def gui_confirm_trade(action: str, symbol: str, quantity: float, total_usd: float, profit_loss: Optional[float] = None, indicator_info: str = "") -> bool:
-    result = {"confirmed": False}
-    win = tk.Toplevel()
-    win.title(f"Confirm {action.capitalize()} for {symbol}")
-    info = f"Action: {action.upper()} for {symbol}\nQuantity: {quantity:.8f}\nTotal USD: ${total_usd:.2f}\n"
-    if profit_loss is not None:
-        info += f"Profit/Loss: ${profit_loss:.2f}\n"
-    if indicator_info:
-        info += f"{indicator_info}\n"
-    tk.Label(win, text=info, padx=10, pady=10).pack()
-    def on_confirm():
-        result["confirmed"] = True
-        win.destroy()
-    def on_cancel():
-        win.destroy()
-    btn_frame = tk.Frame(win)
-    btn_frame.pack(pady=10)
-    tk.Button(btn_frame, text="Confirm", command=on_confirm).pack(side="left", padx=5)
-    tk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=5)
-    win.grab_set()
-    win.wait_window()
-    return result["confirmed"]
-
-def main():
-    bot = CryptoAPITrading()
-    # Override bot's confirm_trade with GUI version that shows indicator values.
-    # For demonstration, we pass a dummy indicator_info; you can customize further.
-    bot.confirm_trade = lambda a, s, q, t, p=None: gui_confirm_trade(a, s, q, t, p, indicator_info="(Indicator details go here)")
-    app = TradingBotGUI(bot)
-    app.mainloop()
-
-if __name__ == "__main__":
-    main()
